@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nanochat-web-rl
+  namespace: yunjae-park-kf-profile
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nanochat-web-rl
+  template:
+    metadata:
+      labels:
+        app: nanochat-web-rl
+        kueue.x-k8s.io/queue-name: default-queue
+        kueue.x-k8s.io/priority-class: inference-preemption
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      schedulerName: kai-scheduler
+      containers:
+      - name: nanochat
+        image: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+        workingDir: /data/workspace/kimberly/nanochat
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -ex
+            
+            # Install system dependencies
+            apt-get update && apt-get install -y curl unzip git
+            
+            # Install Rust for tokenizer
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            
+            # Install uv
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+            
+            # Already in correct directory (/data/workspace/kimberly/nanochat)
+            
+            # Create venv and install dependencies
+            uv venv
+            source .venv/bin/activate
+            uv sync
+            
+            # Build tokenizer
+            uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+            
+            # Run web server with RL model
+            python -m scripts.chat_web \
+              --num-gpus 1 \
+              --source rl \
+              --port 8001 \
+              --host 0.0.0.0 \
+              --temperature 0.8 \
+              --top-k 50 \
+              --max-tokens 512
+        ports:
+        - containerPort: 8001
+          name: http
+          protocol: TCP
+        env:
+        - name: NANOCHAT_BASE_DIR
+          value: /data/workspace/kimberly/.cache/nanochat
+        - name: HF_HOME
+          value: /data/cache_dir/huggingface
+        - name: USER_WORKSPACE
+          value: /data/workspace/kimberly
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            memory: 12Gi
+            cpu: "4"
+          requests:
+            nvidia.com/gpu: "1"
+            memory: 12Gi
+            cpu: "4"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: distributed-pvc
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nanochat-web-rl
+  namespace: yunjae-park-kf-profile
+spec:
+  selector:
+    app: nanochat-web-rl
+  ports:
+  - name: http
+    port: 8001
+    targetPort: 8001
+    protocol: TCP
+  type: LoadBalancer
+
