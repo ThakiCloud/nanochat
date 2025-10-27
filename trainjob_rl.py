@@ -124,7 +124,7 @@ def nanochat_rl_training():
     
     # Rollout generator function
     @torch.no_grad()
-    def get_batch(step):
+    def get_batch():
         assistant_end = tokenizer.encode_special("<|assistant_end|>")
         rank_indices = range(ddp_rank, len(train_task), ddp_world_size)
         
@@ -140,7 +140,7 @@ def nanochat_rl_training():
             num_sampling_steps = num_samples // device_batch_size
             
             for sampling_step in range(num_sampling_steps):
-                seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF
+                seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF  # step from outer scope
                 with autocast_ctx:
                     generated_token_sequences_batch, masks_batch = engine.generate_batch(
                         tokens,
@@ -238,8 +238,10 @@ def nanochat_rl_training():
     print0(f"Examples per step: {examples_per_step}")
     print0("="*80 + "\n")
     
+    # Create batch iterator once before the loop
+    batch_iterator = get_batch()
+    
     for step in range(num_steps):
-        batch_iterator = get_batch(step)
         
         # Evaluation
         if step % eval_every == 0:
@@ -348,6 +350,40 @@ def nanochat_rl_training():
             )
             print0(f"✅ Saved model checkpoint to {checkpoint_dir}")
     
+    # Final evaluation on full test set (Pass@1 with greedy decoding)
+    if master_process:
+        print0("\n" + "="*80)
+        print0("Running final evaluation on full GSM8K test set...")
+        print0("Evaluation mode: Pass@1 (greedy decoding)")
+        print0("="*80 + "\n")
+    
+    model.eval()
+    pass1_final = torch.zeros(1, device=device)
+    with autocast_ctx:
+        records_iter = run_gsm8k_eval(
+            val_task, tokenizer, engine,
+            num_samples=1,  # Pass@1 only
+            max_examples=None,  # Full test set!
+            max_completion_tokens=512,  # Match chat_eval.py default
+            temperature=0.0  # Greedy decoding
+        )
+        records = list(records_iter)
+    
+    # Calculate Pass@1 on full test set
+    pass1_final[0] = sum(any(o["is_correct"] for o in r["outcomes"][:1]) for r in records)
+    
+    num_records_final = torch.tensor(len(records), dtype=torch.long, device=device)
+    if ddp:
+        dist.all_reduce(num_records_final, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pass1_final, op=dist.ReduceOp.SUM)
+    
+    pass1_final = pass1_final / num_records_final.item()
+    pass1_accuracy = pass1_final[0].item()
+    
+    print0(f"\n🎯 Final Evaluation Results")
+    print0(f"Pass@1 Accuracy: {pass1_accuracy:.4f} ({pass1_accuracy*100:.2f}%)")
+    wandb_run.log({"step": num_steps, "final_pass@1": pass1_accuracy})
+    
     # Cleanup
     if ddp:
         dist.barrier()
@@ -356,6 +392,33 @@ def nanochat_rl_training():
         print0("\n" + "="*80)
         print0("RL Training completed successfully!")
         print0("="*80)
+    
+    # Log to report
+    from nanochat.report import get_report
+    get_report().log(section="Chat RL (Kubeflow TrainJob)", data=[
+        user_config, # CLI args
+        { # stats about the training setup
+            "Number of training steps": num_steps,
+            "Training examples": len(train_task),
+            "Evaluation examples": eval_examples,
+            "DDP world size": ddp_world_size,
+            "Total sequences per step": examples_per_step * num_samples,
+        },
+        { # stats about training outcomes
+            "Final checkpoint": f"model_{step:06d}.pt",
+            "Training method": "Policy Gradient (REINFORCE)",
+            "Initial model": f"{source} checkpoint",
+            "Final model type": "RL-trained model",
+            "Infrastructure": "2x H100 GPUs via Kubeflow",
+            "Total training time": "~3 hours",
+        },
+        { # Final evaluation results on full test set
+            "Test set": "GSM8K",
+            "Test set size": len(val_task),
+            "Pass@1 Accuracy": f"{pass1_accuracy:.4f}",
+            "Pass@1 Percentage": f"{pass1_accuracy*100:.2f}%",
+        }
+    ])
     
     wandb_run.finish()
     compute_cleanup()
